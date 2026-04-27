@@ -1,0 +1,222 @@
+// ============================================================================
+// AzAKSAssessment — KQL library
+// READ-ONLY: every query is a SELECT (no .set / .alter / .drop / .ingest).
+// ----------------------------------------------------------------------------
+// The runner (collect-kql.ps1) splits this file on lines that start with
+//   // ===<NAME>===
+// Each section is then sent to the configured Log Analytics workspace.
+// Tokens substituted by the runner before submission:
+//   {{NODE_SUBNETS}}    comma-separated list of node-subnet IDs (lowercased)
+//   {{ONPREM_PREFIXES}} comma-separated CIDRs for on-prem detection
+//   {{LOOKBACK}}        time range in d/h (e.g. 7d, 24h)
+// ============================================================================
+
+// ===TELEMETRY_INVENTORY===
+// What evidence sources actually exist in this workspace?
+union withsource=Table
+    (NTANetAnalytics                | take 1 | project Table='NTANetAnalytics'),
+    (AzureNetworkAnalytics_CL       | take 1 | project Table='AzureNetworkAnalytics_CL'),
+    (AzureDiagnostics               | take 1 | project Table='AzureDiagnostics'),
+    (AZFWNetworkRule                | take 1 | project Table='AZFWNetworkRule'),
+    (AZFWApplicationRule            | take 1 | project Table='AZFWApplicationRule'),
+    (AZFWDnsQuery                   | take 1 | project Table='AZFWDnsQuery'),
+    (ContainerLogV2                 | take 1 | project Table='ContainerLogV2'),
+    (InsightsMetrics                | take 1 | project Table='InsightsMetrics'),
+    (AKSAudit                       | take 1 | project Table='AKSAudit'),
+    (AKSAuditAdmin                  | take 1 | project Table='AKSAuditAdmin'),
+    (AKSControlPlane                | take 1 | project Table='AKSControlPlane')
+| summarize Present = count() by Table
+
+// ===NS_INTERNET_EGRESS_TOP===
+// North/south outbound: top external destinations from cluster node subnets.
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where FlowDirection == 'Outbound'
+| where FlowType in ('ExternalPublic','MaliciousFlow')
+| summarize
+    Flows       = count(),
+    BytesOut    = sum(toLong(BytesSrcToDest)),
+    BytesIn     = sum(toLong(BytesDestToSrc)),
+    Ports       = make_set(DestPort, 25),
+    FirstSeen   = min(TimeGenerated),
+    LastSeen    = max(TimeGenerated)
+    by DestPublicIps, DestRegion, DestCountry
+| order by BytesOut desc
+| take 200
+
+// ===NS_INTERNET_EGRESS_BY_ASN===
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where FlowDirection == 'Outbound' and FlowType == 'ExternalPublic'
+| summarize Flows=count(), BytesOut=sum(toLong(BytesSrcToDest)) by Country, DestRegion
+| order by BytesOut desc
+
+// ===NS_INTERNET_INGRESS_UNSOLICITED===
+// Inbound from internet that did NOT land on a known public-IP frontend
+// (parameter list of allowed PIPs is not yet wired; rely on FlowDirection).
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where DestSubnet in~ ({{NODE_SUBNETS}})
+| where FlowDirection == 'Inbound' and FlowType == 'ExternalPublic'
+| summarize Flows=count(), BytesIn=sum(toLong(BytesSrcToDest)) by SrcPublicIps, DestPort, DestIp
+| order by Flows desc
+| take 200
+
+// ===EW_INTRA_VNET===
+// East/west: cluster nodes talking to other private destinations in any VNet
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where FlowType in ('IntraVNet','InterVNet','AzurePublic')
+| summarize Flows=count(), BytesOut=sum(toLong(BytesSrcToDest)), Ports=make_set(DestPort,25)
+    by DestSubnet, DestIp, FlowType
+| order by BytesOut desc
+| take 200
+
+// ===CROSS_VNET_PEERING===
+// East/west across VNet peerings - DestSubnet that doesn't share VNet with source.
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where FlowType == 'InterVNet'
+| extend SrcVnet = tostring(split(SrcSubnet,'/subnets/')[0])
+| extend DestVnet = tostring(split(DestSubnet,'/subnets/')[0])
+| where SrcVnet != DestVnet
+| summarize Flows=count(), BytesOut=sum(toLong(BytesSrcToDest)) by DestVnet, DestSubnet
+| order by BytesOut desc
+
+// ===ONPREM_TRAFFIC===
+// Flows whose destination IP is in the user-supplied on-prem prefix list.
+let onprem = dynamic([{{ONPREM_PREFIXES}}]);
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where ipv4_is_in_any_range(DestIp, onprem)
+| summarize Flows=count(), BytesOut=sum(toLong(BytesSrcToDest)), Ports=make_set(DestPort,25) by DestIp
+| order by BytesOut desc
+
+// ===PAAS_PE_BYPASS===
+// Microsoft service (FlowType AzurePublic) reached via public IP from a node
+// subnet -- candidate Private Endpoint bypass / DNS misconfig.
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where FlowType == 'AzurePublic'
+| summarize Flows=count(), BytesOut=sum(toLong(BytesSrcToDest)) by DestIp, DestRegion
+| order by BytesOut desc
+| take 100
+
+// ===PER_NODE_ATTRIBUTION===
+// Group outbound by source IP (= node IP) to attribute load per node.
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where FlowDirection == 'Outbound'
+| summarize Flows=count(), BytesOut=sum(toLong(BytesSrcToDest)),
+    UniqueDests=dcount(DestIp), DestSample=make_set(DestIp,5) by SrcIp
+| order by BytesOut desc
+
+// ===EXFIL_VOLUME_OUTLIERS===
+// Single destination IP receiving significantly more bytes than the median.
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where FlowDirection == 'Outbound' and FlowType in ('ExternalPublic','MaliciousFlow')
+| summarize BytesOut=sum(toLong(BytesSrcToDest)), BytesIn=sum(toLong(BytesDestToSrc)),
+    Flows=count() by DestIp, bin(TimeGenerated,1h)
+| extend OutInRatio = todouble(BytesOut)/(todouble(BytesIn)+1)
+| where BytesOut > 100*1024*1024  // > 100 MB/h to single dst
+| order by BytesOut desc
+
+// ===EXFIL_BEACONING===
+// Regular-interval communication: many flows with small inter-arrival std-dev.
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where FlowDirection == 'Outbound' and FlowType in ('ExternalPublic','MaliciousFlow')
+| extend bucket = bin(TimeGenerated, 1m)
+| summarize Hits=count() by SrcIp, DestIp, DestPort, bucket
+| summarize BucketsActive=count(), TotalHits=sum(Hits),
+    Intervals=make_list(bucket) by SrcIp, DestIp, DestPort
+| where BucketsActive >= 30
+| extend AvgInterval = (todatetime(Intervals[array_length(Intervals)-1]) - todatetime(Intervals[0])) / (BucketsActive-1)
+| project SrcIp, DestIp, DestPort, BucketsActive, TotalHits, AvgInterval
+| order by BucketsActive desc
+
+// ===EXFIL_LONG_LIVED===
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where FlowType in ('ExternalPublic','MaliciousFlow')
+| extend Duration = FlowEndTime - FlowStartTime
+| where Duration > 1h
+| project TimeGenerated, SrcIp, DestIp, DestPort, Duration, BytesSrcToDest, BytesDestToSrc, L7Protocol
+| order by Duration desc
+| take 200
+
+// ===EXFIL_UNUSUAL_PORTS===
+// Outbound to internet on suspicious ports from node subnets.
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where FlowDirection == 'Outbound' and FlowType in ('ExternalPublic','MaliciousFlow')
+| where DestPort in (22, 23, 3389, 445, 139, 1433, 3306, 5432, 6379, 9200, 11211, 853)
+| summarize Flows=count(), BytesOut=sum(toLong(BytesSrcToDest)) by DestPort, DestIp
+| order by Flows desc
+
+// ===EXFIL_TI_MATCHES===
+NTANetAnalytics
+| where TimeGenerated > ago({{LOOKBACK}})
+| where SrcSubnet in~ ({{NODE_SUBNETS}})
+| where FlowType == 'MaliciousFlow'
+| project TimeGenerated, SrcIp, DestIp, DestPort, FlowDirection, BytesSrcToDest, L7Protocol
+| order by TimeGenerated desc
+| take 500
+
+// ===AZFW_APP_RULE_HITS===
+// If Azure Firewall is in the path: top FQDNs requested through it.
+AZFWApplicationRule
+| where TimeGenerated > ago({{LOOKBACK}})
+| summarize Hits=count(), LastSeen=max(TimeGenerated) by Fqdn, Action, Protocol
+| order by Hits desc
+| take 200
+
+// ===AZFW_DNS_QUERIES===
+AZFWDnsQuery
+| where TimeGenerated > ago({{LOOKBACK}})
+| summarize Hits=count(), LastSeen=max(TimeGenerated) by QueryName, ResponseCode
+| order by Hits desc
+| take 500
+
+// ===AZFW_DNS_TUNNELING===
+// Long subdomain labels = DNS-tunneling tell.
+AZFWDnsQuery
+| where TimeGenerated > ago({{LOOKBACK}})
+| extend FirstLabel = tostring(split(QueryName,'.')[0])
+| where strlen(FirstLabel) > 50
+| project TimeGenerated, QueryName, strlen(FirstLabel), ResponseCode, SourceIp
+| order by TimeGenerated desc
+| take 200
+
+// ===AKS_AUDIT_SECRET_READS===
+// Read-only correlation: who/what is reading Secrets / ConfigMaps?
+AKSAudit
+| where TimeGenerated > ago({{LOOKBACK}})
+| where Verb in ('get','list','watch')
+| where ObjectRef contains 'secrets' or ObjectRef contains 'configmaps'
+| summarize Reads=count(), LastSeen=max(TimeGenerated)
+    by User=tostring(User.username), ObjectRef=tostring(ObjectRef)
+| order by Reads desc
+| take 200
+
+// ===CONTAINER_LOG_DNS_FORWARDER===
+// CoreDNS log evidence (only if container logs include kube-system/coredns).
+ContainerLogV2
+| where TimeGenerated > ago({{LOOKBACK}})
+| where PodNamespace == 'kube-system' and PodName startswith 'coredns'
+| where LogMessage matches regex @'(?i)(forward|loop|errors|NXDOMAIN)'
+| project TimeGenerated, PodName, LogMessage
+| order by TimeGenerated desc
+| take 500

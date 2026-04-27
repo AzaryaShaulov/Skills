@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   Discovers the in-scope subscriptions for AzAKSAssessment:
@@ -20,12 +20,33 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $OutputDir            = (Join-Path $PSScriptRoot "data"),
-    [string] $RequiredTenantDomain = '',
-    [string] $SubscriptionPrefix   = ''
+    [string]   $OutputDir            = '',
+    [string]   $TenantName           = '',
+    [string]   $RequiredTenantDomain = '',
+    [string]   $SubscriptionPrefix   = '',
+    # Explicit allowlists. Precedence (highest first):
+    #   -SubscriptionIds  (sub GUIDs, exact match)
+    #   -SubscriptionNames (display names, exact match, case-insensitive)
+    #   -SubscriptionPrefix (legacy name-prefix wildcard)
+    # When -SubscriptionIds is non-empty the other two are ignored.
+    [string[]] $SubscriptionIds      = @(),
+    [string[]] $SubscriptionNames    = @()
 )
 
 $ErrorActionPreference = "Stop"
+
+# Lazy default: when -OutputDir is not supplied, materialize the same per-run
+# dated layout that run.ps1 uses: azaksassessment/reports/<date>_<Cust>/<date>_Data
+if (-not $OutputDir) {
+    $rawCust = if ($TenantName)            { $TenantName }
+               elseif ($RequiredTenantDomain) { ($RequiredTenantDomain -split '\.')[0] }
+               else                        { 'Customer' }
+    $safeCust = ($rawCust -replace '[^A-Za-z0-9._-]', '-').Trim('-')
+    if (-not $safeCust) { $safeCust = 'Customer' }
+    $runDate     = Get-Date -Format 'yyyy-MM-dd'
+    $reportsBase = Join-Path (Split-Path $PSScriptRoot -Parent) 'reports'
+    $OutputDir   = Join-Path $reportsBase (("{0}_{1}" -f $runDate, $safeCust) + '\' + ("{0}_Data" -f $runDate))
+}
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
 
 # ── READ-ONLY ENFORCEMENT ────────────────────────────────────────────
@@ -33,7 +54,7 @@ if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir
 Write-Output "[READ-ONLY] AzAKSAssessment scope discovery (no writes performed)."
 
 # ── Tenant guard (supports guest/external accounts) ──────────────────
-$ctx = az account show -o json 2>$null | ConvertFrom-Json
+$ctx = az account show --only-show-errors -o json 2>$null | ConvertFrom-Json
 if (-not $ctx) { throw "Not logged in. Run: az login --tenant $RequiredTenantDomain" }
 $tenantDomain = ($ctx.user.name -replace '^[^@]+@','')
 if (-not $tenantDomain) { $tenantDomain = $ctx.tenantId }
@@ -54,11 +75,18 @@ Write-Output "=== AzAKSAssessment Scope Discovery (read-only) ==="
 Write-Output ("Tenant            : {0}  ({1})" -f $tenantDomain, $ctx.tenantId)
 
 # ── All visible enabled subs ─────────────────────────────────────────
-$allSubs = az account list --query "[?state=='Enabled']" -o json | ConvertFrom-Json
+$allSubs = az account list --only-show-errors --query "[?state=='Enabled']" -o json 2>$null | ConvertFrom-Json
 if (-not $allSubs) { throw "No enabled subscriptions visible. Run 'az login'." }
 # Filter by tenant + optional name prefix
 $allSubs = @($allSubs | Where-Object { $_.tenantId -eq $ctx.tenantId })
-if ($SubscriptionPrefix) {
+if ($SubscriptionIds -and $SubscriptionIds.Count -gt 0) {
+    $allSubs = @($allSubs | Where-Object { $SubscriptionIds -contains $_.id })
+    Write-Output ("Sub allowlist (Ids)  : {0} entr(y/ies)" -f $SubscriptionIds.Count)
+} elseif ($SubscriptionNames -and $SubscriptionNames.Count -gt 0) {
+    $namesLower = $SubscriptionNames | ForEach-Object { $_.ToLower() }
+    $allSubs = @($allSubs | Where-Object { $namesLower -contains $_.name.ToLower() })
+    Write-Output ("Sub allowlist (Names): {0} entr(y/ies)" -f $SubscriptionNames.Count)
+} elseif ($SubscriptionPrefix) {
     $allSubs = @($allSubs | Where-Object { $_.name -like "$SubscriptionPrefix*" })
     Write-Output ("Sub prefix filter    : {0}*" -f $SubscriptionPrefix)
 }
@@ -72,7 +100,7 @@ Write-Output ("Visible enabled subs : {0}" -f $allSubs.Count)
 function Invoke-Arg {
     param([string]$Query, [Parameter(Mandatory)][string[]]$Subs)
     $flatQuery = ($Query -replace '\r?\n',' ').Trim()
-    $raw = az graph query -q $flatQuery --subscriptions $Subs --first 1000 -o json 2>$null
+    $raw = az graph query -q $flatQuery --subscriptions $Subs --first 1000 --only-show-errors -o json 2>$null
     if (-not $raw) { return @() }
     $parsed = $raw | ConvertFrom-Json
     if (-not $parsed.data) { return @() }

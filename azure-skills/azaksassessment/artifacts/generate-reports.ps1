@@ -18,8 +18,8 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $DataDir              = (Join-Path $PSScriptRoot "data"),
-    [string] $OutputDir            = (Join-Path $PSScriptRoot "reports"),
+    [string] $DataDir              = '',
+    [string] $OutputDir            = '',
     [string] $TenantName           = '',
     [string] $RequiredTenantDomain = '',
 
@@ -30,6 +30,23 @@ param(
     [switch] $StableFilename
 )
 $ErrorActionPreference = "Stop"
+
+# Lazy defaults: when -DataDir / -OutputDir are not supplied, materialize the
+# same per-run dated layout that run.ps1 uses:
+#   azaksassessment/reports/<date>_<Cust>/<date>_Data    (-DataDir)
+#   azaksassessment/reports/<date>_<Cust>/<date>_Reports (-OutputDir)
+if ((-not $DataDir) -or (-not $OutputDir)) {
+    $rawCust = if ($TenantName)            { $TenantName }
+               elseif ($RequiredTenantDomain) { ($RequiredTenantDomain -split '\.')[0] }
+               else                        { 'Customer' }
+    $safeCust = ($rawCust -replace '[^A-Za-z0-9._-]', '-').Trim('-')
+    if (-not $safeCust) { $safeCust = 'Customer' }
+    $runDate     = Get-Date -Format 'yyyy-MM-dd'
+    $reportsBase = Join-Path (Split-Path $PSScriptRoot -Parent) 'reports'
+    $runRoot     = Join-Path $reportsBase ("{0}_{1}" -f $runDate, $safeCust)
+    if (-not $DataDir)   { $DataDir   = Join-Path $runRoot ("{0}_Data"    -f $runDate) }
+    if (-not $OutputDir) { $OutputDir = Join-Path $runRoot ("{0}_Reports" -f $runDate) }
+}
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
 Write-Output "[READ-ONLY] AzAKSAssessment report generation (no Azure writes)."
 
@@ -55,6 +72,20 @@ if (Test-Path $resolvedLawFile) {
     if ($resolved) { $law = @($law) + @($resolved) | Sort-Object id -Unique }
 }
 $diag = if (Test-Path (Join-Path $DataDir "diagnostic-settings.json")) { Get-Content (Join-Path $DataDir "diagnostic-settings.json") -Raw | ConvertFrom-Json } else { @() }
+
+# Optional gap sentinels written by collect-effective-routes.ps1 / collect-kql.ps1.
+$rbacGapFile = Join-Path $DataDir 'effective-routes-rbac-gap.json'
+$kqlGapFile  = Join-Path $DataDir 'kql-law-gap.json'
+$rbacGap = if (Test-Path $rbacGapFile) { Get-Content $rbacGapFile -Raw | ConvertFrom-Json } else { $null }
+$kqlGap  = if (Test-Path $kqlGapFile)  { Get-Content $kqlGapFile  -Raw | ConvertFrom-Json } else { $null }
+$gapBanners = [System.Text.StringBuilder]::new()
+if ($rbacGap) {
+    [void]$gapBanners.AppendLine("<div class='bannerWarn'><strong>RBAC gap:</strong> effective-routes / NSG collection denied for <code>$($rbacGap.authFailures)</code> of <code>$($rbacGap.totalNicAttempts)</code> NICs (AuthorizationFailed). Grant <strong>Network Contributor</strong> on each <code>MC_*</code> node resource group and re-run.</div>")
+}
+if ($kqlGap) {
+    [void]$gapBanners.AppendLine("<div class='bannerWarn'><strong>Diagnostic coverage gap:</strong> $($kqlGap.subsWithoutLaw) of $($kqlGap.totalAksSubs) AKS sub(s) had no Log Analytics workspace bound to AKS diagnostic settings. The exfiltration hunt produced no data for them. Bind a workspace via <code>az monitor diagnostic-settings create</code> (kube-apiserver / kube-audit / guard categories) and re-run.</div>")
+}
+$gapBannersHtml = $gapBanners.ToString()
 
 # ----------------------------------------------------------------------
 # Diagnostic-coverage helper (Bug 3 fix).
@@ -115,6 +146,8 @@ h3{font-size:1.05rem;font-weight:600;margin:1.25rem 0 .5rem}h4{font-size:.95rem;
 .muted{color:#475569;font-size:.875rem}
 .banner{background:#fef3c7;border:1px solid #f59e0b;color:#92400e;padding:.5rem 1rem;border-radius:.5rem;margin:.5rem 0;font-size:.85rem}
 .bannerOk{background:#dcfce7;border:1px solid #16a34a;color:#14532d;padding:.5rem 1rem;border-radius:.5rem;margin:.5rem 0;font-size:.85rem;font-weight:600}
+.bannerWarn{background:#fee2e2;border:1px solid #b91c1c;color:#7f1d1d;padding:.6rem 1rem;border-radius:.5rem;margin:.5rem 0;font-size:.85rem;line-height:1.5}
+.bannerWarn code{background:#fff;border:1px solid #fecaca;border-radius:3px;padding:1px 4px;font-size:.75rem}
 .disclaimer{background:#f0f4ff;border:1px solid #6366f1;color:#312e81;padding:.6rem 1rem;border-radius:.5rem;margin:.5rem 0;font-size:.8rem;line-height:1.5}
 .card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:.75rem;padding:1.25rem;margin-bottom:1rem}
 .grid4{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:.5rem}
@@ -520,6 +553,7 @@ $($svg.ToString())
 <div class='container'>
 <div class='disclaimer'><strong>Disclaimer:</strong> This is an <strong>unofficial</strong> community report, <strong>not</strong> a Microsoft product. Provided <strong>as-is</strong>. See repository for source.</div>
 <div class='bannerOk'>READ-ONLY &mdash; zero writes.</div>
+$gapBannersHtml
 <h1 id='summary'>$(Esc $subName)</h1><p class='muted'><code>$subId</code> &middot; $(Esc $TenantName) &middot; $ts</p>
 <div class='card'><div class='grid4' style='text-align:center'>
 <div class='stat'><div class='num'>$($clusters.Count)</div><div class='lbl'>Clusters</div></div>
@@ -640,6 +674,7 @@ foreach($e in ($indexEntries|Sort-Object subName)){foreach($f in @($e.findings))
 <div class='container'>
 <div class='disclaimer'><strong>Disclaimer:</strong> Unofficial community report, <strong>not</strong> Microsoft. Provided <strong>as-is</strong>. See repository for source.</div>
 <div class='bannerOk'>READ-ONLY &mdash; zero writes.</div>
+$gapBannersHtml
 <h1 id='summary'>AKS Traffic Flow</h1><p class='muted'>$(Esc $TenantName) &middot; $ts</p>
 <div class='card'><h3>Summary</h3><div class='grid4' style='text-align:center;margin-top:.5rem'>
 <div class='stat'><div class='num'>$($indexEntries.Count)</div><div class='lbl'>Subs</div></div>

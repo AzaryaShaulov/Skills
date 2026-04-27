@@ -28,6 +28,10 @@ param(
     [string] $TenantName           = '',
     [string] $RequiredTenantDomain = '',
     [string] $SubscriptionPrefix   = '',
+    # Explicit subscription allowlists (forwarded to discover-scope.ps1).
+    # Precedence: -SubscriptionIds > -SubscriptionNames > -SubscriptionPrefix.
+    [string[]] $SubscriptionIds    = @(),
+    [string[]] $SubscriptionNames  = @(),
 
     [switch] $SkipPrecheck,
     [switch] $SkipDiscover,
@@ -163,7 +167,7 @@ if (-not $SkipPrecheck) {
     $LASTEXITCODE = 0
 }
 if (-not $SkipDiscover -and -not (Skip-IfFresh '2. discover-scope' (Join-Path $dataDir 'scope.json'))) {
-    Step "2. discover-scope" { & (Join-Path $base "discover-scope.ps1") -RequiredTenantDomain $RequiredTenantDomain -SubscriptionPrefix $SubscriptionPrefix -OutputDir $dataDir }
+    Step "2. discover-scope" { & (Join-Path $base "discover-scope.ps1") -RequiredTenantDomain $RequiredTenantDomain -SubscriptionPrefix $SubscriptionPrefix -SubscriptionIds $SubscriptionIds -SubscriptionNames $SubscriptionNames -OutputDir $dataDir }
 }
 if (-not $SkipCollect -and -not (Skip-IfFresh '3. collect-data' (Join-Path $dataDir 'arg-aks.json'))) {
     # Note: -SubscriptionPrefix filtering is applied only during discover-scope

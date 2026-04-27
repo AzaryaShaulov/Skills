@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   Collect Azure Monitor metrics for the L4/L7 devices in each AKS egress path.
@@ -22,17 +22,31 @@
 param(
     [int]    $LookbackHours        = 168,
     [string] $Interval             = 'PT1H',
-    [string] $OutputDir            = (Join-Path $PSScriptRoot "data"),
+    [string] $OutputDir            = '',
+    [string] $TenantName           = '',
     [string] $RequiredTenantDomain = ''
 )
 
 $ErrorActionPreference = "Stop"
+
+# Lazy default: when -OutputDir is not supplied, materialize the same per-run
+# dated layout that run.ps1 uses: azaksassessment/reports/<date>_<Cust>/<date>_Data
+if (-not $OutputDir) {
+    $rawCust = if ($TenantName)            { $TenantName }
+               elseif ($RequiredTenantDomain) { ($RequiredTenantDomain -split '\.')[0] }
+               else                        { 'Customer' }
+    $safeCust = ($rawCust -replace '[^A-Za-z0-9._-]', '-').Trim('-')
+    if (-not $safeCust) { $safeCust = 'Customer' }
+    $runDate     = Get-Date -Format 'yyyy-MM-dd'
+    $reportsBase = Join-Path (Split-Path $PSScriptRoot -Parent) 'reports'
+    $OutputDir   = Join-Path $reportsBase (("{0}_{1}" -f $runDate, $safeCust) + '\' + ("{0}_Data" -f $runDate))
+}
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
 
 Write-Output "[READ-ONLY] AzAKSAssessment metrics collection (no writes performed)."
 
 # Tenant guard (supports guest/external accounts)
-$ctx = az account show -o json 2>$null | ConvertFrom-Json
+$ctx = az account show --only-show-errors -o json 2>$null | ConvertFrom-Json
 if (-not $ctx) { throw "Not logged in. Run: az login --tenant $RequiredTenantDomain" }
 $tenantDomain = ($ctx.user.name -replace '^[^@]+@','')
 if (-not $tenantDomain) { $tenantDomain = $ctx.tenantId }
@@ -87,6 +101,7 @@ function Get-Metrics {
             --interval $Interval `
             --start-time $startTime `
             --end-time   $endTime `
+            --only-show-errors `
             -o json 2>$null
         if ($raw) { return ($raw | ConvertFrom-Json) }
     } catch {
@@ -99,7 +114,7 @@ foreach ($aks in $aksList) {
     Write-Output ""
     Write-Output ("--- AKS: {0}  (sub={1}  outboundType={2})" -f $aks.name, $aks.subscriptionId, $aks.outboundType)
 
-    az account set --subscription $aks.subscriptionId | Out-Null
+    az account set --subscription $aks.subscriptionId --only-show-errors 2>$null | Out-Null
 
     $bundle = [ordered]@{
         aks            = @{ id=$aks.id; name=$aks.name; sub=$aks.subscriptionId; outboundType=$aks.outboundType }
@@ -131,11 +146,11 @@ foreach ($aks in $aksList) {
     if ($aks.outboundType -ieq 'userDefinedRouting') {
         foreach ($fw in $fws) {
             Write-Output ("    FW    : {0}  (sub={1})" -f $fw.name, $fw.subscriptionId)
-            az account set --subscription $fw.subscriptionId | Out-Null
+            az account set --subscription $fw.subscriptionId --only-show-errors 2>$null | Out-Null
             $m = Get-Metrics -ResourceId $fw.id -Kind 'fw'
             $bundle.firewalls += @{ id=$fw.id; name=$fw.name; sub=$fw.subscriptionId; metrics=$m }
         }
-        az account set --subscription $aks.subscriptionId | Out-Null
+        az account set --subscription $aks.subscriptionId --only-show-errors 2>$null | Out-Null
     }
 
     $tag  = "{0}-{1}" -f $aks.subscriptionId.Substring(0,8), (Sanitize $aks.name)

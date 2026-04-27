@@ -25,18 +25,32 @@
 param(
     [string]   $OnpremPrefixes       = '',
     [int]      $LookbackDays         = 7,
-    [string]   $OutputDir            = (Join-Path $PSScriptRoot "data"),
+    [string]   $OutputDir            = '',
     [string]   $QueriesFile          = (Join-Path $PSScriptRoot "Queries.kql"),
+    [string]   $TenantName           = '',
     [string]   $RequiredTenantDomain = ''
 )
 
 $ErrorActionPreference = "Stop"
+
+# Lazy default: when -OutputDir is not supplied, materialize the same per-run
+# dated layout that run.ps1 uses: azaksassessment/reports/<date>_<Cust>/<date>_Data
+if (-not $OutputDir) {
+    $rawCust = if ($TenantName)            { $TenantName }
+               elseif ($RequiredTenantDomain) { ($RequiredTenantDomain -split '\.')[0] }
+               else                        { 'Customer' }
+    $safeCust = ($rawCust -replace '[^A-Za-z0-9._-]', '-').Trim('-')
+    if (-not $safeCust) { $safeCust = 'Customer' }
+    $runDate     = Get-Date -Format 'yyyy-MM-dd'
+    $reportsBase = Join-Path (Split-Path $PSScriptRoot -Parent) 'reports'
+    $OutputDir   = Join-Path $reportsBase (("{0}_{1}" -f $runDate, $safeCust) + '\' + ("{0}_Data" -f $runDate))
+}
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
 
 Write-Output "[READ-ONLY] AzAKSAssessment KQL collection (no writes performed)."
 
 # Tenant guard (supports guest/external accounts)
-$ctx = az account show -o json 2>$null | ConvertFrom-Json
+$ctx = az account show --only-show-errors -o json 2>$null | ConvertFrom-Json
 if (-not $ctx) { throw "Not logged in. Run: az login --tenant $RequiredTenantDomain" }
 $tenantDomain = ($ctx.user.name -replace '^[^@]+@','')
 if (-not $tenantDomain) { $tenantDomain = $ctx.tenantId }
@@ -97,6 +111,12 @@ $resolvedLaw = New-Object System.Collections.Generic.List[object]
 # Group AKS by subscription
 $aksBySub = $aksList | Group-Object subscriptionId
 
+# Per-run counters for end-of-phase summary.
+$script:subsWithLaw    = 0
+$script:subsWithoutLaw = 0
+$script:queriesRun     = 0
+$script:queriesPlanned = 0
+
 foreach ($subGroup in $aksBySub) {
     $subId = $subGroup.Name
     Write-Output ""
@@ -130,8 +150,10 @@ foreach ($subGroup in $aksBySub) {
     if (-not $workspaces) {
         Write-Warning ("  No Log Analytics workspaces found in diagnostic settings for sub {0}." -f $subId)
         Write-Warning  "  KQL phase will be skipped for this sub. (Coverage gap will be flagged in the report.)"
+        $script:subsWithoutLaw++
         continue
     }
+    $script:subsWithLaw++
 
     # OnPrem prefixes -> KQL array literal (sanitized)
     $onpremCsv = if ($OnpremPrefixes) {
@@ -156,10 +178,10 @@ foreach ($subGroup in $aksBySub) {
                 continue
             }
             Write-Output ("  Resolving cross-sub workspace {0} ..." -f $wsResId)
-            $prevSub = (az account show --query id -o tsv 2>$null)
+            $prevSub = (az account show --query id --only-show-errors -o tsv 2>$null)
             try {
-                az account set --subscription $wsSubId 2>$null | Out-Null
-                $wsRaw = az monitor log-analytics workspace show --ids $wsResId -o json 2>$null
+                az account set --subscription $wsSubId --only-show-errors 2>$null | Out-Null
+                $wsRaw = az monitor log-analytics workspace show --ids $wsResId --only-show-errors -o json 2>$null
                 if (-not $wsRaw) { throw "az returned no data" }
                 $wsObj = $wsRaw | ConvertFrom-Json
                 $ws = [pscustomobject]@{
@@ -175,19 +197,20 @@ foreach ($subGroup in $aksBySub) {
                 Write-Output ("    -> resolved: {0} customerId={1}" -f $ws.name, $ws.customerId)
             } catch {
                 Write-Warning ("  Workspace {0} unresolvable (RBAC / cross-tenant?); skipping. {1}" -f $wsResId, $_.Exception.Message)
-                if ($prevSub) { az account set --subscription $prevSub 2>$null | Out-Null }
+                if ($prevSub) { az account set --subscription $prevSub --only-show-errors 2>$null | Out-Null }
                 continue
             }
         }
         Write-Output ("  Workspace: {0}  ({1})" -f $ws.name, $ws.customerId)
 
         # READ-ONLY context switch to the workspace's sub
-        az account set --subscription $ws.subscriptionId | Out-Null
+        az account set --subscription $ws.subscriptionId --only-show-errors 2>$null | Out-Null
 
         $outDir = Join-Path $OutputDir ("kql\{0}\{1}" -f $subId, (Sanitize $ws.name))
         if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
         foreach ($kv in $queries.GetEnumerator()) {
+            $script:queriesPlanned++
             $qname  = $kv.Key
             $qbody  = $kv.Value
             $qbody  = $qbody -replace '\{\{NODE_SUBNETS\}\}',    $nodeSubnetCsv
@@ -200,8 +223,10 @@ foreach ($subGroup in $aksBySub) {
                     --workspace $ws.customerId `
                     --analytics-query $qbody `
                     --timespan ("P{0}D" -f $LookbackDays) `
+                    --only-show-errors `
                     -o json 2>$null
                 if ($resp) {
+                    $script:queriesRun++
                     $rows = $resp | ConvertFrom-Json
                     if (@($rows).Count -gt 0) {
                         $csvFile = Join-Path $outDir ("{0}.csv" -f $qname)
@@ -223,5 +248,25 @@ if ($resolvedLaw.Count -gt 0) {
     $resolvedFile = Join-Path $OutputDir "arg-law-resolved.json"
     $resolvedLaw | ConvertTo-Json -Depth 6 | Out-File $resolvedFile -Encoding utf8
     Write-Output ("Cross-sub workspaces resolved: {0} -> {1}" -f $resolvedLaw.Count, $resolvedFile)
+}
+
+# ── End-of-phase coverage summary (Gap 5) ────────────────────────────
+$totalAksSubs = @($aksBySub).Count
+Write-Output ""
+Write-Output ("KQL phase: {0} of {1} AKS sub(s) had LAW-bound diagnostic settings; queries executed: {2} of {3}" `
+    -f $script:subsWithLaw, $totalAksSubs, $script:queriesRun, $script:queriesPlanned)
+if ($script:subsWithoutLaw -gt 0) {
+    Write-Warning ("{0} sub(s) had no LAW binding -> exfiltration hunt produced no data for them. See per-report 'Diagnostic coverage' banner." -f $script:subsWithoutLaw)
+    $kqlGap = [ordered]@{
+        timestamp        = (Get-Date).ToString('o')
+        gap              = 'kql-law-coverage-gap'
+        totalAksSubs     = $totalAksSubs
+        subsWithLaw      = $script:subsWithLaw
+        subsWithoutLaw   = $script:subsWithoutLaw
+        queriesPlanned   = $script:queriesPlanned
+        queriesRun       = $script:queriesRun
+        remediation      = 'Bind a Log Analytics workspace to AKS diagnostic settings (kube-apiserver, kube-audit, guard categories).'
+    }
+    $kqlGap | ConvertTo-Json -Depth 6 | Out-File (Join-Path $OutputDir 'kql-law-gap.json') -Encoding utf8
 }
 Write-Output "Done."

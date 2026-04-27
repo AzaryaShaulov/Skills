@@ -101,30 +101,54 @@ Or run all via `run.ps1`.
 
 ## Output layout
 
+Both `run.ps1` and direct invocation of any individual script (when `-OutputDir`
+/ `-DataDir` are not supplied) write into the same per-run dated tree under
+`azaksassessment\reports\`. The customer label resolves from `-TenantName` →
+first label of `-RequiredTenantDomain` → `Customer`.
+
 ```
-<TenantOrCustomer>/<yyyy-MM-dd_HHmm>-AKSAssessment/
-  data/
-    scoped-subscriptions.json
-    arg-aks.json
-    arg-vnets.json
-    arg-peerings.json
-    arg-nsgs.json
-    arg-routetables.json
-    arg-loadbalancers.json
-    arg-natgateways.json
-    arg-firewalls.json
-    arg-privateendpoints.json
-    arg-privatednszones.json
-    arg-publicips.json
-    arg-gateways.json
-    arg-flowlogs.json
-    arg-networkwatchers.json
-    arg-law.json
-    effective-routes-<aksname>.json   # per AKS cluster
-    effective-nsgs-<aksname>.json
-    metrics-<aksname>.json
-    kql-<workspace>-<query>.csv
-  reports/
-    <subname>-AKSAssessment-<ts>.html  # ONE per AKS-bearing sub
+azaksassessment\reports\
+└── <yyyy-MM-dd>_<CustomerName>\
+    ├── <yyyy-MM-dd>_Data\
+    │     precheck-summary.json
+    │     scope.json
+    │     scoped-subscriptions.json
+    │     arg-aks.json
+    │     arg-vnets.json
+    │     arg-peerings.json
+    │     arg-nsgs.json
+    │     arg-routetables.json
+    │     arg-loadbalancers.json
+    │     arg-natgateways.json
+    │     arg-firewalls.json
+    │     arg-privateendpoints.json
+    │     arg-privatednszones.json
+    │     arg-privatednslinks.json
+    │     arg-publicips.json
+    │     arg-appgateways.json
+    │     arg-flowlogs.json
+    │     arg-law.json
+    │     diagnostic-settings.json
+    │     effective-routes-<aksname>.json   # per AKS cluster
+    │     effective-nsgs-<aksname>.json
+    │     effective-routes-rbac-gap.json    # sentinel — present only on RBAC gap
+    │     metrics-<resource>.json
+    │     kql-<workspace>-<query>.csv
+    │     kql-law-gap.json                  # sentinel — present only when no LAW in scope
+    └── <yyyy-MM-dd>_Reports\
+          index.html                        # TOC + exec summary + version pills + gap banners
+          <subname>-AKSAssessment.html      # ONE per AKS-bearing sub (stable name by default)
 ```
+
+Filename behavior:
+
+- **Stable filenames (default):** rerunning overwrites the per-sub HTML so the
+  link targets in `index.html` stay valid.
+- **Timestamped filenames:** pass `run.ps1 -TimestampedFilenames` (or call
+  `generate-reports.ps1` without `-StableFilename`) to get
+  `<subname>-AKSAssessment-<yyyyMMdd_HHmm>.html` instead.
+
+Sentinel files (`*-rbac-gap.json`, `*-law-gap.json`) are read by
+`generate-reports.ps1` and surface as a `bannerWarn` block at the top of both
+`index.html` and each per-sub report.
 

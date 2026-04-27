@@ -40,7 +40,19 @@ param(
     # Advisory by default. When set, a precheck failure aborts the run.
     [switch] $StrictPrecheck,
     # Forwarded to collect-data.ps1 — limits Phase 2 diagnostics to AKS targets only.
-    [switch] $DiagAksOnly
+    [switch] $DiagAksOnly,
+
+    # Filename mode (per-sub HTML reports). Default = stable: each rerun
+    # overwrites the prior file, since the per-run dated folder already
+    # provides time/scope partitioning. Opt in to legacy timestamped names
+    # via -TimestampedFilenames (e.g., when piping into a shared folder).
+    [switch] $TimestampedFilenames,
+
+    # Skip a phase if its primary artifact in -OutputDir is younger than
+    # this many hours. 0 disables the freshness check (always collect).
+    # -ForceRefresh always re-collects regardless.
+    [int]    $MaxDataAgeHours = 24,
+    [switch] $ForceRefresh
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,13 +64,14 @@ if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
 }
 
 # ------------------------------------------------------------------
-# Per-run output layout:
-#   <artifacts>/<yyyy-MM-dd>_<CustomerName>/
+# Per-run output layout (rooted at <skill>/reports/, NOT under artifacts/):
+#   azaksassessment/reports/<yyyy-MM-dd>_<CustomerName>/
 #       <yyyy-MM-dd>_Data/      (all collection JSON / CSV)
 #       <yyyy-MM-dd>_Reports/   (HTML reports + index.html)
-# CustomerName falls back to TenantName, then to RequiredTenantDomain's
-# leading label, then to 'Customer'. All non-filesystem-safe chars are
-# replaced with '-'.
+# Keeps the read-only toolchain (artifacts/) cleanly separated from
+# customer-specific output. CustomerName falls back to TenantName, then
+# to RequiredTenantDomain's leading label, then to 'Customer'. All
+# non-filesystem-safe chars are replaced with '-'.
 # ------------------------------------------------------------------
 $runDate = Get-Date -Format 'yyyy-MM-dd'
 $rawCust = if ($TenantName)           { $TenantName }
@@ -67,9 +80,11 @@ $rawCust = if ($TenantName)           { $TenantName }
 $safeCust = ($rawCust -replace '[^A-Za-z0-9._-]', '-').Trim('-')
 if (-not $safeCust) { $safeCust = 'Customer' }
 
-$runRoot   = Join-Path $base    ("{0}_{1}"      -f $runDate, $safeCust)
-$dataDir   = Join-Path $runRoot ("{0}_Data"     -f $runDate)
-$reportDir = Join-Path $runRoot ("{0}_Reports"  -f $runDate)
+# $base = artifacts/  ->  $reportsBase = ../reports/  (i.e. azaksassessment/reports/)
+$reportsBase = Join-Path (Split-Path $base -Parent) 'reports'
+$runRoot   = Join-Path $reportsBase ("{0}_{1}"      -f $runDate, $safeCust)
+$dataDir   = Join-Path $runRoot     ("{0}_Data"     -f $runDate)
+$reportDir = Join-Path $runRoot     ("{0}_Reports"  -f $runDate)
 New-Item -ItemType Directory -Force -Path $dataDir, $reportDir | Out-Null
 
 Write-Output "=========================================================="
@@ -100,6 +115,34 @@ function Step($name, [scriptblock]$body) {
     }
 }
 
+# ------------------------------------------------------------------
+# Freshness short-circuit. A step is skipped when its primary artifact
+# already exists in $dataDir AND its LastWriteTime is within
+# $MaxDataAgeHours. -ForceRefresh disables the skip. Set
+# -MaxDataAgeHours 0 to always re-collect.
+# ------------------------------------------------------------------
+function Test-Fresh {
+    param([Parameter(Mandatory)][string]$PrimaryFile)
+    if ($ForceRefresh)            { return $false }
+    if ($MaxDataAgeHours -le 0)   { return $false }
+    if (-not (Test-Path $PrimaryFile)) { return $false }
+    $age = (Get-Date) - (Get-Item $PrimaryFile).LastWriteTime
+    return ($age.TotalHours -lt $MaxDataAgeHours)
+}
+function Skip-IfFresh {
+    param([string]$Name, [string]$PrimaryFile)
+    if (Test-Fresh -PrimaryFile $PrimaryFile) {
+        $ageH = ((Get-Date) - (Get-Item $PrimaryFile).LastWriteTime).TotalHours
+        # Write-Host so these status lines don't pollute the function's return value
+        # (which is the boolean used by the caller's `if (Skip-IfFresh ...)`).
+        Write-Host ""
+        Write-Host ("---- STEP: {0} (SKIP - fresh data, age {1:N1}h < {2}h) ----" -f $Name, $ageH, $MaxDataAgeHours)
+        Write-Host ("     primary: {0}" -f $PrimaryFile)
+        return $true
+    }
+    return $false
+}
+
 if (-not $SkipPrecheck) {
     # Precheck is advisory — warn but don't abort on non-zero exit OR on a
     # terminating exception (e.g., AADSTS530004 from a tenant CA / compliance
@@ -119,25 +162,51 @@ if (-not $SkipPrecheck) {
     }
     $LASTEXITCODE = 0
 }
-if (-not $SkipDiscover) {
+if (-not $SkipDiscover -and -not (Skip-IfFresh '2. discover-scope' (Join-Path $dataDir 'scope.json'))) {
     Step "2. discover-scope" { & (Join-Path $base "discover-scope.ps1") -RequiredTenantDomain $RequiredTenantDomain -SubscriptionPrefix $SubscriptionPrefix -OutputDir $dataDir }
 }
-if (-not $SkipCollect) {
+if (-not $SkipCollect -and -not (Skip-IfFresh '3. collect-data' (Join-Path $dataDir 'arg-aks.json'))) {
     # Note: -SubscriptionPrefix filtering is applied only during discover-scope
     # and baked into scope.json. Downstream scripts read scope.json directly.
     Step "3. collect-data"   { & (Join-Path $base "collect-data.ps1") -RequiredTenantDomain $RequiredTenantDomain -OutputDir $dataDir -ScopeFile (Join-Path $dataDir 'scope.json') -DiagAksOnly:$DiagAksOnly }
 }
 if (-not $SkipEffective) {
-    Step "4. collect-effective-routes" { & (Join-Path $base "collect-effective-routes.ps1") -RequiredTenantDomain $RequiredTenantDomain -OutputDir $dataDir }
+    # Effective routes write per-cluster files (effective-routes-*.json); use the
+    # newest matching file as the freshness signal.
+    $erNewest = Get-ChildItem -Path $dataDir -Filter 'effective-routes-*.json' -EA SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not ($erNewest -and (Skip-IfFresh '4. collect-effective-routes' $erNewest.FullName))) {
+        Step "4. collect-effective-routes" { & (Join-Path $base "collect-effective-routes.ps1") -RequiredTenantDomain $RequiredTenantDomain -OutputDir $dataDir }
+    }
 }
 if (-not $SkipMetrics) {
-    Step "5. collect-metrics" { & (Join-Path $base "collect-metrics.ps1") -LookbackHours ($LookbackDays * 24) -RequiredTenantDomain $RequiredTenantDomain -OutputDir $dataDir }
+    $mNewest = Get-ChildItem -Path $dataDir -Filter 'metrics-*.json' -EA SilentlyContinue |
+               Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not ($mNewest -and (Skip-IfFresh '5. collect-metrics' $mNewest.FullName))) {
+        Step "5. collect-metrics" { & (Join-Path $base "collect-metrics.ps1") -LookbackHours ($LookbackDays * 24) -RequiredTenantDomain $RequiredTenantDomain -OutputDir $dataDir }
+    }
 }
 if (-not $SkipKql) {
-    Step "6. collect-kql"     { & (Join-Path $base "collect-kql.ps1") -OnpremPrefixes $OnpremPrefixes -LookbackDays $LookbackDays -RequiredTenantDomain $RequiredTenantDomain -OutputDir $dataDir }
+    # Use the kql/ folder modification time (newest CSV anywhere under it).
+    $kqlNewest = Get-ChildItem -Path (Join-Path $dataDir 'kql') -Recurse -Filter '*.csv' -EA SilentlyContinue |
+                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not ($kqlNewest -and (Skip-IfFresh '6. collect-kql' $kqlNewest.FullName))) {
+        Step "6. collect-kql"     { & (Join-Path $base "collect-kql.ps1") -OnpremPrefixes $OnpremPrefixes -LookbackDays $LookbackDays -RequiredTenantDomain $RequiredTenantDomain -OutputDir $dataDir }
+    }
 }
 if (-not $SkipReports) {
-    Step "7. generate-reports" { & (Join-Path $base "generate-reports.ps1") -TenantName $TenantName -RequiredTenantDomain $RequiredTenantDomain -DataDir $dataDir -OutputDir $reportDir }
+    # Reports are deterministic from current data; always re-render so the
+    # freshly-merged inputs (e.g., arg-law-resolved.json) are reflected. The
+    # -StableFilename flag (default ON in run.ps1) makes the per-sub HTML
+    # overwrite cleanly instead of accumulating timestamped duplicates.
+    Step "7. generate-reports" {
+        & (Join-Path $base "generate-reports.ps1") `
+            -TenantName $TenantName `
+            -RequiredTenantDomain $RequiredTenantDomain `
+            -DataDir $dataDir `
+            -OutputDir $reportDir `
+            -StableFilename:(-not $TimestampedFilenames)
+    }
 }
 
 Write-Output ""

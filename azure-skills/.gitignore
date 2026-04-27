@@ -13,13 +13,14 @@ node_modules/
 # ----------------------------------------------------------------------
 # AzAKSAssessment per-run output (may contain customer-identifying data)
 # Layout produced by run.ps1:
-#   <artifacts>/<yyyy-MM-dd>_<CustomerName>/
-#       <yyyy-MM-dd>_Data/      (collected JSON / CSV \u2014 may include
+#   azaksassessment/reports/<yyyy-MM-dd>_<CustomerName>/
+#       <yyyy-MM-dd>_Data/      (collected JSON / CSV — may include
 #                                resource IDs, tenant IDs, IPs, names)
 #       <yyyy-MM-dd>_Reports/   (HTML reports built from the above)
 # Also catches any legacy data/ or reports/ folders if a script is run
 # directly without the dated wrapper.
 # ----------------------------------------------------------------------
+azaksassessment/reports/
 azaksassessment/artifacts/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/
 azaksassessment/artifacts/data/
 azaksassessment/artifacts/reports/

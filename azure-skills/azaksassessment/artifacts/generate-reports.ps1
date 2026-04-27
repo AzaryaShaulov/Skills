@@ -21,7 +21,13 @@ param(
     [string] $DataDir              = (Join-Path $PSScriptRoot "data"),
     [string] $OutputDir            = (Join-Path $PSScriptRoot "reports"),
     [string] $TenantName           = '',
-    [string] $RequiredTenantDomain = ''
+    [string] $RequiredTenantDomain = '',
+
+    # When set, per-subscription HTML files are named
+    # "<sub>-AKSAssessment.html" (no timestamp) so reruns into the same
+    # -OutputDir overwrite cleanly. Default keeps the legacy timestamped
+    # name for back-compat with operators piping into shared folders.
+    [switch] $StableFilename
 )
 $ErrorActionPreference = "Stop"
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
@@ -124,6 +130,12 @@ td{padding:.4rem .75rem;border-bottom:1px solid #e2e8f0;vertical-align:top}tr:ho
 .smallTable td,.smallTable th{font-size:.8rem;padding:.25rem .5rem}
 .indexCard{background:#f8fafc;border:1px solid #e2e8f0;border-radius:.75rem;padding:1rem 1.25rem;margin-bottom:.75rem;display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap}
 .indexCard:hover{border-color:#93c5fd;background:#eff6ff}
+.tocList{list-style:none;padding:0;margin:.5rem 0;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:.35rem .75rem}
+.tocList li{font-size:.85rem;line-height:1.4;border-left:3px solid #cbd5e1;padding:.15rem .5rem;background:#f8fafc;border-radius:0 .25rem .25rem 0}
+.tocList li:hover{border-left-color:#2563eb;background:#eff6ff}
+.tocList a{text-decoration:none;color:#1e40af;font-weight:600}
+.tocList a:hover{text-decoration:underline}
+.tocList .tocMeta{color:#64748b;font-weight:400;font-size:.75rem;margin-left:.35rem}
 .issueCard{border-left:4px solid #b91c1c;background:#fef2f2;border:1px solid #fecaca;border-left:4px solid #b91c1c;border-radius:.5rem;padding:.75rem 1rem;margin-bottom:.5rem}
 .issueCardMed{border-left-color:#ea580c;background:#fff7ed;border-color:#fed7aa}
 .stat{text-align:center}.stat .num{font-size:1.5rem;font-weight:700;color:#1e40af}.stat .lbl{font-size:.75rem;color:#64748b}
@@ -496,7 +508,11 @@ $($svg.ToString())
 "@
 
     # â”€â”€ Compose HTML â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    $reportFile = "{0}-AKSAssessment-{1}.html" -f (Sanitize $subName),$ts
+    $reportFile = if ($StableFilename) {
+        "{0}-AKSAssessment.html" -f (Sanitize $subName)
+    } else {
+        "{0}-AKSAssessment-{1}.html" -f (Sanitize $subName), $ts
+    }
     @"
 <!doctype html><html lang='en'><head><meta charset='utf-8'><title>AKS Traffic Flow - $(Esc $subName)</title>$css</head><body>
 <div class='nav'><strong>AKS Traffic Flow</strong><a href='index.html'>&larr; Index</a><span class='muted'>|</span><span class='muted'>$(Esc $subName)</span><span class='muted'>$ts</span><span style='flex:1'></span>
@@ -599,6 +615,13 @@ $(if($subAgws.Count-gt0){"<h2 id='agw'>App Gateways ($($subAgws.Count))</h2><det
 Write-Output "Building index.html..."
 $tC=$aks.Count;$tV=$vnets.Count;$tP=$pes.Count;$tL=$lbs.Count;$tI=$pips.Count;$tN=$nsgs.Count;$tR=$rts.Count;$tF=$flowlogs.Count
 $tH=($indexEntries|Measure-Object -Property highFinds -Sum).Sum;$tM=($indexEntries|Measure-Object -Property medFinds -Sum).Sum;$tA=($indexEntries|Measure-Object -Property totalFinds -Sum).Sum
+$tocList=[System.Text.StringBuilder]::new()
+$idx=0
+foreach($e in ($indexEntries|Sort-Object subName)){
+    $idx++
+    $sevPill=if($e.highFinds-gt0){"<span class='pill crit' style='font-size:.65rem;padding:0 5px'>$($e.highFinds)H</span>"}elseif($e.medFinds-gt0){"<span class='pill warn' style='font-size:.65rem;padding:0 5px'>$($e.medFinds)M</span>"}else{"<span class='pill ok' style='font-size:.65rem;padding:0 5px'>OK</span>"}
+    [void]$tocList.AppendLine("<li><span class='muted' style='font-size:.7rem'>$idx.</span> <a href='$($e.fileName)'>$(Esc $e.subName)</a> $sevPill<span class='tocMeta'>$($e.clusters) cluster$(if($e.clusters-ne1){'s'})</span></li>")
+}
 $tocRows=[System.Text.StringBuilder]::new()
 foreach($e in ($indexEntries|Sort-Object subName)){$hp=if($e.highFinds-gt0){"<span class='pill crit'>$($e.highFinds) High</span>"}else{''};$mp=if($e.medFinds-gt0){"<span class='pill warn'>$($e.medFinds) Med</span>"}else{''}
     # Version status pills per version
@@ -613,7 +636,7 @@ foreach($e in ($indexEntries|Sort-Object subName)){foreach($f in @($e.findings))
 @"
 <!doctype html><html lang='en'><head><meta charset='utf-8'><title>AKS Traffic Flow - $(Esc $TenantName)</title>$css</head><body>
 <div class='nav'><strong>AKS Traffic Flow</strong><span class='muted'>$(Esc $TenantName)</span><span class='muted'>$ts</span><span style='flex:1'></span>
-<a href='#summary'>Summary</a><a href='#subscriptions'>Subs</a><a href='#issues'>Issues</a><a href='#limitations'>Limits</a></div>
+<a href='#summary'>Summary</a><a href='#reports'>Reports</a><a href='#subscriptions'>Subs</a><a href='#issues'>Issues</a><a href='#limitations'>Limits</a></div>
 <div class='container'>
 <div class='disclaimer'><strong>Disclaimer:</strong> Unofficial community report, <strong>not</strong> Microsoft. Provided <strong>as-is</strong>. See repository for source.</div>
 <div class='bannerOk'>READ-ONLY &mdash; zero writes.</div>
@@ -634,6 +657,9 @@ $(if($tH-gt0){"<span class='pill crit' style='font-size:.85rem;padding:3px 14px'
 $(if($tM-gt0){"<span class='pill warn' style='font-size:.85rem;padding:3px 14px'>$tM Medium</span>"}else{""})
 <span class='pill muted' style='font-size:.85rem;padding:3px 14px'>$tA total</span>
 </div></div>
+<h2 id='reports'>Reports index</h2>
+<div class='card'><p class='muted' style='margin-top:0'>Jump directly to a per-subscription report. <strong>$($indexEntries.Count)</strong> subscription$(if($indexEntries.Count-ne1){'s'}) with AKS clusters.</p>
+<ol class='tocList'>$($tocList.ToString())</ol></div>
 <h2 id='subscriptions'>Subscriptions ($($indexEntries.Count))</h2>
 $($tocRows.ToString())
 <h2 id='issues'>Issues</h2>

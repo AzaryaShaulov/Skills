@@ -23,12 +23,15 @@
 .PARAMETER OutputDir
   Default: <script>\data
 .PARAMETER ScopeFile
-  Default: <OutputDir>\scope.json (from discover-scope.ps1).
+  Default: <OutputDir>\scope.json (i.e. tracks -OutputDir). Pass an
+  explicit path to override. Avoid relying on the legacy shared
+  <script>\data\scope.json — mixing it with a per-run -OutputDir was
+  the root cause of cross-scope reports.
 #>
 [CmdletBinding()]
 param(
     [string] $OutputDir            = (Join-Path $PSScriptRoot "data"),
-    [string] $ScopeFile            = (Join-Path $PSScriptRoot "data\scope.json"),
+    [string] $ScopeFile            = '',
     [string] $RequiredTenantDomain = '',
 
     # Bug 5 mitigation: when set, Phase 2 only collects diagnostic settings on
@@ -39,6 +42,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+# Lazy default: bind ScopeFile to OutputDir AFTER param parsing, so passing
+# only -OutputDir auto-resolves to <OutputDir>\scope.json instead of silently
+# falling back to the shared default and inventorying the wrong scope.
+if (-not $ScopeFile) { $ScopeFile = Join-Path $OutputDir 'scope.json' }
 
 # ── READ-ONLY ENFORCEMENT ────────────────────────────────────────────
 # Allowed verbs only: az ... show|list|graph query, Get-Az*, Search-AzGraph,

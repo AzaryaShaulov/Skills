@@ -81,17 +81,23 @@ If a workspace referenced by a diagnostic setting lives **outside** the assessme
 
 ## Run order
 
-```
-1. precheck.ps1              # confirm read-only RBAC across all in-scope subs
-2. discover-scope.ps1        # find AKS-bearing subs + auto-include peers/hub/connectivity
-3. collect-data.ps1          # ARG inventory of AKS, networking, telemetry surfaces
-4. collect-effective-routes.ps1   # per-pool node NIC effective routes + NSGs (ground truth)
-5. collect-metrics.ps1       # LB SNAT, NAT GW, FW capacity metrics
-6. collect-kql.ps1           # run Queries.kql against each detected workspace
-7. generate-reports.ps1      # one HTML report per AKS-bearing subscription
+```powershell
+# 1. precheck.ps1              # confirm read-only RBAC across all in-scope subs
+# 2. discover-scope.ps1        # find AKS-bearing subs + auto-include peers/hub/connectivity
+# 3. collect-data.ps1          # ARG inventory of AKS, networking, telemetry surfaces
+# 4. collect-effective-routes.ps1   # per-pool node NIC effective routes + NSGs
+# 5. collect-metrics.ps1       # LB SNAT, NAT GW, FW capacity metrics
+# 6. collect-kql.ps1           # run Queries.kql against each detected workspace
+# 7. generate-reports.ps1      # per-sub HTML + index.html
 ```
 
 Or run all via `run.ps1`.
+
+### Direct-invocation caveats
+
+- `collect-data.ps1` defaults `-ScopeFile` to `<OutputDir>\scope.json`. If you pass `-OutputDir` to a fresh folder you **must** also place a `scope.json` there (typically by running `discover-scope.ps1 -OutputDir <same folder>` first) or pass `-ScopeFile` explicitly. Without this, the script fails fast — no more silent fall-back to a shared scope file.
+- `generate-reports.ps1` accepts `-StableFilename` to overwrite the per-sub HTML on rerun (instead of writing a new timestamped file each time). `run.ps1` passes this by default; opt out at the orchestrator level via `-TimestampedFilenames`.
+- `run.ps1` skips a phase whose primary artifact in `-OutputDir` is younger than `-MaxDataAgeHours` (default 24). Use `-ForceRefresh` to override or `-MaxDataAgeHours 0` to always re-collect.
 
 ## Output layout
 

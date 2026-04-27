@@ -107,6 +107,12 @@ No-op (not error) when no Log Analytics workspaces are in scope. `Queries.kql` b
 ```
 Use `-Skip*` switches to resume from any phase.
 
+**Idempotency / freshness:**
+
+- Per-subscription HTML files use **stable filenames** by default (e.g., `mysub-AKSAssessment.html`) so a rerun into the same `_Reports` folder overwrites the prior file. Pass `-TimestampedFilenames` to keep the legacy `...-yyyy-MM-dd_HHmm.html` form.
+- Each collection phase is **skipped if its primary artifact in `_Data` is younger than `-MaxDataAgeHours` (default 24)**. Pass `-ForceRefresh` to always re-collect, or `-MaxDataAgeHours 0` to disable the freshness check entirely. The report phase always re-renders.
+- When invoking `collect-data.ps1` directly, `-ScopeFile` now defaults to `<OutputDir>\scope.json` (was the legacy shared `<artifacts>\data\scope.json`). Direct callers must either point `-OutputDir` at a folder containing the right `scope.json`, or pass `-ScopeFile` explicitly — this prevents cross-scope inventory collection.
+
 ## PowerShell Conventions (when editing toolchain scripts)
 
 - `#requires -Version 5.1`, `[CmdletBinding()]`, `param()`, `$ErrorActionPreference = 'Stop'`.
@@ -160,27 +166,29 @@ Then verify each generated HTML:
 
 ## Outputs
 
-`run.ps1` creates a fresh, dated, customer-named folder for every run so multiple assessments don't collide. The customer name is taken from `-TenantName`, falling back to the leading label of `-RequiredTenantDomain`, then to `Customer`. Unsafe filesystem characters are replaced with `-`.
+`run.ps1` creates a fresh, dated, customer-named folder for every run under `azaksassessment/reports/` (kept separate from the read-only `artifacts/` toolchain and ignored by git). The customer name is taken from `-TenantName`, falling back to the leading label of `-RequiredTenantDomain`, then to `Customer`. Unsafe filesystem characters are replaced with `-`.
 
 ```
-artifacts/
-└── <yyyy-MM-dd>_<CustomerName>/
-    ├── <yyyy-MM-dd>_Data/
-    │   ├── scope.json
-    │   ├── arg-*.json                   # ARG inventory per resource type
-    │   ├── diag-*.json
-    │   ├── effective-routes-<aks>.json
-    │   ├── metrics-<resource>.json
-    │   └── kql-<workspace>-<query>.csv
-    └── <yyyy-MM-dd>_Reports/
-        ├── <subname>-AKSAssessment-<ts>.html   # one per AKS-bearing sub
-        └── index.html                          # TOC + exec summary + version pills
+azaksassessment/
+├── artifacts/                     # toolchain (in source control)
+└── reports/                       # per-run output (gitignored)
+    └── <yyyy-MM-dd>_<CustomerName>/
+        ├── <yyyy-MM-dd>_Data/
+        │   ├── scope.json
+        │   ├── arg-*.json                 # ARG inventory per resource type
+        │   ├── diag-*.json
+        │   ├── effective-routes-<aks>.json
+        │   ├── metrics-<resource>.json
+        │   └── kql-<workspace>-<query>.csv
+        └── <yyyy-MM-dd>_Reports/
+            ├── <subname>-AKSAssessment-<ts>.html   # one per AKS-bearing sub
+            └── index.html                          # TOC + exec summary + version pills
 ```
 
 Example:
 
 ```
-artifacts/2026-04-27_Contoso/
+azaksassessment/reports/2026-04-27_Contoso/
 ├── 2026-04-27_Data/
 └── 2026-04-27_Reports/
 ```

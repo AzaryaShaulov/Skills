@@ -9,3 +9,30 @@ node_modules/
 *.log
 *.bak
 *.tmp
+
+# ----------------------------------------------------------------------
+# AzAKSAssessment per-run output (may contain customer-identifying data)
+# Layout produced by run.ps1:
+#   <artifacts>/<yyyy-MM-dd>_<CustomerName>/
+#       <yyyy-MM-dd>_Data/      (collected JSON / CSV \u2014 may include
+#                                resource IDs, tenant IDs, IPs, names)
+#       <yyyy-MM-dd>_Reports/   (HTML reports built from the above)
+# Also catches any legacy data/ or reports/ folders if a script is run
+# directly without the dated wrapper.
+# ----------------------------------------------------------------------
+azaksassessment/artifacts/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*/
+azaksassessment/artifacts/data/
+azaksassessment/artifacts/reports/
+
+# Defensive globs in case the toolchain is copied elsewhere in the repo
+**/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*_Data/
+**/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_*_Reports/
+**/arg-*.json
+**/diagnostic-settings.json
+**/diagnostic-errors.json
+**/arg-law-resolved.json
+**/scope.json
+**/scoped-subscriptions.json
+**/effective-routes-*.json
+**/metrics-*.json
+**/kql/

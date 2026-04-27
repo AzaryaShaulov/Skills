@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   AzAKSAssessment Phase 0+1 ARG inventory collector. READ-ONLY.
@@ -29,7 +29,12 @@
 param(
     [string] $OutputDir            = (Join-Path $PSScriptRoot "data"),
     [string] $ScopeFile            = (Join-Path $PSScriptRoot "data\scope.json"),
-    [string] $RequiredTenantDomain = ''
+    [string] $RequiredTenantDomain = '',
+
+    # Bug 5 mitigation: when set, Phase 2 only collects diagnostic settings on
+    # AKS targets (skips LB/NATGW/FW/PIP). Useful for very large estates where
+    # the AKS-relevant signal is what matters most.
+    [switch] $DiagAksOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -403,16 +408,26 @@ function Load-Arg($name) {
 
 $diagTargets = @()
 $diagTargets += Load-Arg "aks"            | Select-Object @{n='id';e={$_.id}}, @{n='kind';e={'aks'}}
-$diagTargets += Load-Arg "loadbalancers"  | Select-Object @{n='id';e={$_.id}}, @{n='kind';e={'lb'}}
-$diagTargets += Load-Arg "natgateways"    | Select-Object @{n='id';e={$_.id}}, @{n='kind';e={'natgw'}}
-$diagTargets += Load-Arg "firewalls"      | Select-Object @{n='id';e={$_.id}}, @{n='kind';e={'fw'}}
-$diagTargets += Load-Arg "publicips"      | Select-Object @{n='id';e={$_.id}}, @{n='kind';e={'pip'}}
+if (-not $DiagAksOnly) {
+    $diagTargets += Load-Arg "loadbalancers"  | Select-Object @{n='id';e={$_.id}}, @{n='kind';e={'lb'}}
+    $diagTargets += Load-Arg "natgateways"    | Select-Object @{n='id';e={$_.id}}, @{n='kind';e={'natgw'}}
+    $diagTargets += Load-Arg "firewalls"      | Select-Object @{n='id';e={$_.id}}, @{n='kind';e={'fw'}}
+    $diagTargets += Load-Arg "publicips"      | Select-Object @{n='id';e={$_.id}}, @{n='kind';e={'pip'}}
+} else {
+    Write-Output "  -DiagAksOnly: skipping LB / NATGW / FW / PIP diagnostic collection."
+}
 
 $diagSettingsAll = New-Object System.Collections.Generic.List[object]
+$diagErrors      = New-Object System.Collections.Generic.List[object]
+$diagOutFile     = Join-Path $OutputDir "diagnostic-settings.json"
+$diagErrFile     = Join-Path $OutputDir "diagnostic-errors.json"
+$flushEvery      = 25
 $idx = 0; $tot = $diagTargets.Count
 foreach ($t in $diagTargets) {
     $idx++
-    if (($idx % 25) -eq 0) { Write-Output ("  diag {0}/{1}" -f $idx, $tot) }
+    # One progress line per item (streamed) so the user can see this isn't hung.
+    $shortName = ($t.id -split '/')[-1]
+    Write-Host ("  [{0}/{1}] {2,-6} {3}" -f $idx, $tot, $t.kind, $shortName)
     try {
         $diag = az monitor diagnostic-settings list --resource $t.id -o json 2>$null | ConvertFrom-Json
         if ($diag -and $diag.value) {
@@ -429,10 +444,28 @@ foreach ($t in $diagTargets) {
                 })
             }
         }
-    } catch { }
+    } catch {
+        # Capture per-resource errors (e.g., RBAC denials — Bug 6) so they're a
+        # visible artifact instead of being silently swallowed.
+        $diagErrors.Add([pscustomobject]@{
+            targetId   = $t.id
+            targetKind = $t.kind
+            error      = $_.Exception.Message
+            timestamp  = (Get-Date).ToString('o')
+        })
+    }
+    # Incremental flush every N items — Ctrl-C still leaves a parseable file.
+    if (($idx % $flushEvery) -eq 0 -or $idx -eq $tot) {
+        $diagSettingsAll | ConvertTo-Json -Depth 12 | Out-File $diagOutFile -Encoding utf8
+        if ($diagErrors.Count -gt 0) {
+            $diagErrors | ConvertTo-Json -Depth 4 | Out-File $diagErrFile -Encoding utf8
+        }
+    }
 }
-$diagSettingsAll | ConvertTo-Json -Depth 12 | Out-File (Join-Path $OutputDir "diagnostic-settings.json") -Encoding utf8
 Write-Output ("  diag settings rows: {0}" -f $diagSettingsAll.Count)
+if ($diagErrors.Count -gt 0) {
+    Write-Warning ("  diag collection errors: {0} -> {1}" -f $diagErrors.Count, $diagErrFile)
+}
 
 # ── Storage accounts that hold flow logs (for SAS-less blob discovery) ─
 Write-Output ""

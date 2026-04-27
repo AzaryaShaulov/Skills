@@ -37,7 +37,7 @@ Or use the slash command (where supported): `/azaksassessment`.
 ├── .gitignore
 └── azaksassessment/             # one self-contained skill folder
     ├── SKILL.md                 # portable agent skill (canonical)
-    ├── scripts/                 # bundled PowerShell toolchain (10 files)
+    ├── artifacts/               # bundled PowerShell toolchain (10 files)
     │   ├── run.ps1
     │   ├── precheck.ps1
     │   ├── discover-scope.ps1
@@ -67,7 +67,7 @@ Copy-Item .\azaksassessment\vscode\prompts\azaksassessment.prompt.md            
 
 ## Upstream toolchain
 
-The `azaksassessment` skill bundles its own PowerShell toolchain under [`azaksassessment/scripts/`](./azaksassessment/scripts/) — no separate clone is required. See the [bundled README](./azaksassessment/scripts/README.md) for run-order and RBAC requirements.
+The `azaksassessment` skill bundles its own PowerShell toolchain under [`azaksassessment/artifacts/`](./azaksassessment/artifacts/) — no separate clone is required. See the [bundled README](./azaksassessment/artifacts/README.md) for run-order and RBAC requirements.
 
 ## Contributing
 

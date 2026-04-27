@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   Run Queries.kql against every relevant Log Analytics workspace per AKS sub.
@@ -89,6 +89,11 @@ $lawList    = Load-Arg "law"
 $lawByResId = @{}
 foreach ($w in $lawList) { $lawByResId[$w.id.ToLower()] = $w }
 
+# Collects workspaces resolved on-the-fly via direct ARM (cross-sub LAW fallback,
+# Bug 2). Persisted to arg-law-resolved.json so the report and subsequent runs
+# can treat them as part of the inventory.
+$resolvedLaw = New-Object System.Collections.Generic.List[object]
+
 # Group AKS by subscription
 $aksBySub = $aksList | Group-Object subscriptionId
 
@@ -141,8 +146,38 @@ foreach ($subGroup in $aksBySub) {
     foreach ($wsResId in $workspaces) {
         $ws = $lawByResId[$wsResId.ToLower()]
         if (-not $ws) {
-            Write-Warning ("  Workspace {0} not in arg-law inventory; skipping." -f $wsResId)
-            continue
+            # Cross-subscription LAW fallback: workspace was referenced by a
+            # diagnostic setting but isn't in our local arg-law.json (e.g., it
+            # lives in a subscription outside the assessment scope, like a
+            # central observability sub). Try to resolve directly via ARM.
+            $wsSubId = if ($wsResId -match '/subscriptions/([0-9a-fA-F-]{36})/') { $matches[1] } else { $null }
+            if (-not $wsSubId) {
+                Write-Warning ("  Workspace {0} could not be parsed; skipping." -f $wsResId)
+                continue
+            }
+            Write-Output ("  Resolving cross-sub workspace {0} ..." -f $wsResId)
+            $prevSub = (az account show --query id -o tsv 2>$null)
+            try {
+                az account set --subscription $wsSubId 2>$null | Out-Null
+                $wsRaw = az monitor log-analytics workspace show --ids $wsResId -o json 2>$null
+                if (-not $wsRaw) { throw "az returned no data" }
+                $wsObj = $wsRaw | ConvertFrom-Json
+                $ws = [pscustomobject]@{
+                    id             = $wsObj.id
+                    name           = $wsObj.name
+                    customerId     = $wsObj.customerId
+                    subscriptionId = $wsSubId
+                    resourceGroup  = ($wsObj.id -split '/')[4]
+                    location       = $wsObj.location
+                }
+                $lawByResId[$wsResId.ToLower()] = $ws
+                $resolvedLaw.Add($ws) | Out-Null
+                Write-Output ("    -> resolved: {0} customerId={1}" -f $ws.name, $ws.customerId)
+            } catch {
+                Write-Warning ("  Workspace {0} unresolvable (RBAC / cross-tenant?); skipping. {1}" -f $wsResId, $_.Exception.Message)
+                if ($prevSub) { az account set --subscription $prevSub 2>$null | Out-Null }
+                continue
+            }
         }
         Write-Output ("  Workspace: {0}  ({1})" -f $ws.name, $ws.customerId)
 
@@ -184,4 +219,9 @@ foreach ($subGroup in $aksBySub) {
 }
 
 Write-Output ""
+if ($resolvedLaw.Count -gt 0) {
+    $resolvedFile = Join-Path $OutputDir "arg-law-resolved.json"
+    $resolvedLaw | ConvertTo-Json -Depth 6 | Out-File $resolvedFile -Encoding utf8
+    Write-Output ("Cross-sub workspaces resolved: {0} -> {1}" -f $resolvedLaw.Count, $resolvedFile)
+}
 Write-Output "Done."

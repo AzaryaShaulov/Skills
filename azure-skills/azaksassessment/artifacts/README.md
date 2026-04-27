@@ -36,18 +36,48 @@ For the target tenant, the assessment **discovers every subscription that contai
 
 ## Required permissions (least-privilege, read-only)
 
-See `precheck.ps1` for an automated check. Summary:
+Run `precheck.ps1` for an automated check. The whole toolchain is **read-only** — no built-in role with write capability is requested.
 
-| Role | Scope | Why |
+### Built-in roles
+
+| Role | Scope | Used by | Why |
+|---|---|---|---|
+| `Reader` | every in-scope subscription (AKS subs + hub + connectivity) | `discover-scope.ps1`, `collect-data.ps1`, `generate-reports.ps1` | Enumerate AKS, VNets, subnets, NSGs, route tables, LBs, NAT GW, peerings, gateways, PEs, Private DNS, Network Watcher, flow logs, Azure Firewall. |
+| `Azure Kubernetes Service Cluster User Role` | each AKS cluster | optional `kubectl` follow-up | Pull kubeconfig for read-only `kubectl get/describe`. **Not** cluster-admin. |
+| `Monitoring Reader` | each AKS sub + workspace + LB/NAT GW/FW resource | `collect-metrics.ps1`, `collect-kql.ps1` | Read platform metrics on every device in the path. |
+| `Log Analytics Reader` | each Log Analytics workspace (Container Insights, flow logs, firewall logs) | `collect-kql.ps1` | Run the KQL query library. Required for both in-scope LAW and any cross-sub LAW resolved on the fly (`arg-law-resolved.json`). |
+
+### Specific data-plane actions (not covered by `Reader`)
+
+`collect-effective-routes.ps1` calls effective-route / effective-NSG endpoints on AKS **node NICs**. These are POST "actions", not `*/read`, and `Reader` is **not** sufficient. Grant either:
+
+| Option | Scope | Actions granted |
 |---|---|---|
-| `Reader` | every in-scope subscription (AKS subs + hub + connectivity) | Enumerate AKS, VNets, subnets, NSGs, route tables, LBs, NAT GW, peerings, gateways, PEs, Private DNS, Network Watcher, flow logs, Azure Firewall. |
-| `Azure Kubernetes Service Cluster User Role` | each AKS cluster | kubeconfig for read-only `kubectl get/describe`. **Not** cluster-admin. |
-| `Monitoring Reader` | each AKS sub + workspace + LB/NAT GW/FW resources | Read metrics on every device in the path. |
-| `Log Analytics Reader` | each Log Analytics workspace holding flow logs / firewall logs / Container Insights | Run the Phase 3+4 KQL library. |
+| Built-in `Network Contributor` | each AKS node resource group (`MC_*`) | Includes the two actions below — easiest grant. |
+| Custom role (preferred, true least-privilege) | each AKS node resource group (`MC_*`) | `Microsoft.Network/networkInterfaces/effectiveRouteTable/action`, `Microsoft.Network/networkInterfaces/effectiveNetworkSecurityGroups/action` |
 
-Conditional (only if the source exists): `Storage Blob Data Reader` on flow-log storage (when no Traffic Analytics), `Reader` on Azure Firewall RG, `Reader` on Private DNS zones RG, `Microsoft Sentinel Reader` for TI joins.
+Without these, step 4 emits authorization failures and the per-pool routing/NSG sections in the report will be empty. The rest of the assessment still runs.
 
-**Deliberately not requested:** `Contributor`, `Network Contributor`, `*Cluster Admin*`, `Log Analytics Contributor`, `Owner`, `Storage Blob Data Contributor`.
+### Microsoft Graph (precheck only)
+
+`precheck.ps1` issues a few Graph reads (signed-in user, tenant info) for context. A guest / external identity blocked by tenant Conditional Access (e.g., `AADSTS530004` "compliant device required") will fail this step. Because precheck is **advisory**, `run.ps1` downgrades the failure to a warning and continues. Use `-StrictPrecheck` to abort instead. Fix at the environment level by signing in from a compliant device or using a member identity.
+
+### Conditional (only if the source exists)
+
+| Role | Scope | When |
+|---|---|---|
+| `Storage Blob Data Reader` | flow-log storage account | NSG/VNet flow logs without Traffic Analytics |
+| `Reader` | Azure Firewall RG | Firewall present in path |
+| `Reader` | Private DNS zones RG | Private DNS resolution in scope |
+| `Microsoft Sentinel Reader` | Sentinel workspace | TI-match queries in `Queries.kql` |
+
+### Cross-subscription Log Analytics
+
+If a workspace referenced by a diagnostic setting lives **outside** the assessment scope (e.g., a central observability subscription), `collect-kql.ps1` will resolve it on the fly via `az monitor log-analytics workspace show`. The signed-in identity needs `Reader` + `Log Analytics Reader` in **that** subscription too, or the workspace will be flagged unresolvable and skipped.
+
+### Deliberately not requested
+
+`Contributor`, `Network Contributor` at sub scope, `*Cluster Admin*`, `Log Analytics Contributor`, `Owner`, `Storage Blob Data Contributor`, `User Access Administrator`.
 
 ## Run order
 

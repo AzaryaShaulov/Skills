@@ -41,7 +41,43 @@ $nsgs = Load-Arg "nsgs"; $rts = Load-Arg "routetables"; $lbs = Load-Arg "loadbal
 $natgws = Load-Arg "natgateways"; $pips = Load-Arg "publicips"; $pes = Load-Arg "privateendpoints"
 $pdns = Load-Arg "privatednszones"; $pdnsLinks = Load-Arg "privatednslinks"
 $flowlogs = Load-Arg "flowlogs"; $law = Load-Arg "law"; $agws = Load-Arg "appgateways"
+$fws = Load-Arg "firewalls"
+# Merge in any cross-sub workspaces resolved by collect-kql.ps1 (Bug 2 fix).
+$resolvedLawFile = Join-Path $DataDir "arg-law-resolved.json"
+if (Test-Path $resolvedLawFile) {
+    $resolved = Get-Content $resolvedLawFile -Raw | ConvertFrom-Json
+    if ($resolved) { $law = @($law) + @($resolved) | Sort-Object id -Unique }
+}
 $diag = if (Test-Path (Join-Path $DataDir "diagnostic-settings.json")) { Get-Content (Join-Path $DataDir "diagnostic-settings.json") -Raw | ConvertFrom-Json } else { @() }
+
+# ----------------------------------------------------------------------
+# Diagnostic-coverage helper (Bug 3 fix).
+# Coverage = distinct target resources WITH workspaceId / distinct evaluated
+# target resources, mirroring the universe collect-data.ps1 actually scans:
+# AKS + LB + NAT GW + Firewalls + Public IPs.
+# ----------------------------------------------------------------------
+$diagTargetIdsAll = @(
+    @($aks    | Select-Object -ExpandProperty id)
+    @($lbs    | Select-Object -ExpandProperty id)
+    @($natgws | Select-Object -ExpandProperty id)
+    @($fws    | Select-Object -ExpandProperty id)
+    @($pips   | Select-Object -ExpandProperty id)
+) | Where-Object { $_ } | Sort-Object -Unique
+$diagTargetIdsWithLaw = @($diag | Where-Object { $_.workspaceId } | Select-Object -ExpandProperty targetId -Unique)
+$diagCoveredCount     = (@($diagTargetIdsAll) | Where-Object { $diagTargetIdsWithLaw -contains $_ }).Count
+$diagTotalCount       = @($diagTargetIdsAll).Count
+function Get-KindCoverage($kind, $items) {
+    $total = @($items | Select-Object -ExpandProperty id -Unique).Count
+    $covered = @($diag | Where-Object { $_.targetKind -eq $kind -and $_.workspaceId } | Select-Object -ExpandProperty targetId -Unique).Count
+    return [pscustomobject]@{ kind=$kind; total=$total; covered=$covered }
+}
+$diagBreakdown = @(
+    Get-KindCoverage 'aks'   $aks
+    Get-KindCoverage 'lb'    $lbs
+    Get-KindCoverage 'natgw' $natgws
+    Get-KindCoverage 'fw'    $fws
+    Get-KindCoverage 'pip'   $pips
+)
 
 function Sanitize($s) { ($s -replace '[^A-Za-z0-9._-]','-') }
 function Esc($s) { if ($null -eq $s) { return '' }; ([string]$s).Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;').Replace('"','&quot;') }
@@ -289,7 +325,8 @@ foreach ($g in $aksBySub) {
             ($_.properties.sourceAddressPrefixes -and ($_.properties.sourceAddressPrefixes|Where-Object{$_-in@('*','Internet','0.0.0.0/0')})) -or
             ($_.properties.destinationAddressPrefixes -and ($_.properties.destinationAddressPrefixes|Where-Object{$_-in@('*','Internet','0.0.0.0/0')}))
         }
-        if($interesting.Count-eq0){continue}\n        $nsgHighlightCount+=$interesting.Count
+        if($interesting.Count-eq0){continue}
+        $nsgHighlightCount+=$interesting.Count
         $att4=if($nsg.subnets){(@($nsg.subnets)|ForEach-Object{ShortId $_.id})-join', '}elseif($nsg.networkInterfaces){"$(@($nsg.networkInterfaces).Count) NIC(s)"}else{'unattached'}
         [void]$sbN.AppendLine("<details><summary>$(Esc $nsg.name) <span class='muted'>($att4)</span> <span class='pill muted'>$($interesting.Count) rules</span></summary>")
         [void]$sbN.AppendLine("<table class='smallTable'><thead><tr><th>Prio</th><th>Name</th><th>Dir</th><th>Access</th><th>Proto</th><th>Src</th><th>Dst</th><th>Port</th></tr></thead><tbody>")
@@ -608,7 +645,8 @@ $($issueCards.ToString())$(if($tH-eq0-and$tM-eq0){"<p class='muted'>None.</p>"})
 <tr><td>Encrypted payloads</td><td>No inspection</td><td>TLS termination</td></tr>
 <tr><td>Intra-pod flows</td><td>Not captured</td><td>APM/OTel</td></tr>
 <tr><td>Guest RBAC check</td><td>False negatives</td><td>Informational</td></tr>
-<tr><td>Diag coverage</td><td>$(@($diag).Count)/$($aks.Count+$lbs.Count+$pips.Count) have LAW</td><td>Enable diag settings</td></tr>
+<tr><td>Diag coverage</td><td>$diagCoveredCount/$diagTotalCount have LAW</td><td>Enable diag settings</td></tr>
+$(foreach($k in $diagBreakdown){ "<tr><td class='muted' style='padding-left:1.5rem'>&nbsp;&nbsp;$($k.kind)</td><td class='muted'>$($k.covered)/$($k.total)</td><td class='muted'>per resource kind</td></tr>" })
 </tbody></table></div></div></body></html>
 "@ | Out-File (Join-Path $OutputDir "index.html") -Encoding utf8
 Write-Output "  -> index.html"
